@@ -1,0 +1,358 @@
+name: Build GIF Cursor APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate project files
+        run: |
+          set -e
+          mkdir -p proj && cd proj
+          mkdir -p "$(dirname app/build.gradle.kts)"
+          cat > app/build.gradle.kts <<'GIFCURSOR_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.gifcursor"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.gifcursor"
+                  minSdk = 28
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          GIFCURSOR_EOF
+          mkdir -p "$(dirname app/src/main/AndroidManifest.xml)"
+          cat > app/src/main/AndroidManifest.xml <<'GIFCURSOR_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".CursorService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          GIFCURSOR_EOF
+          mkdir -p "$(dirname app/src/main/java/com/example/gifcursor/CursorService.kt)"
+          cat > app/src/main/java/com/example/gifcursor/CursorService.kt <<'GIFCURSOR_EOF'
+          package com.example.gifcursor
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Context
+          import android.content.SharedPreferences
+          import android.graphics.Color
+          import android.graphics.ImageDecoder
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.AnimatedImageDrawable
+          import android.graphics.drawable.Drawable
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewConfiguration
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.ImageView
+          import kotlin.math.hypot
+
+          class CursorService : AccessibilityService(), SharedPreferences.OnSharedPreferenceChangeListener {
+              private lateinit var wm: WindowManager
+              private lateinit var prefs: SharedPreferences
+              private val handler = Handler(Looper.getMainLooper())
+              private var view: ImageView? = null
+
+              override fun onServiceConnected() {
+                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  prefs = getSharedPreferences("cursor", MODE_PRIVATE)
+                  prefs.registerOnSharedPreferenceChangeListener(this)
+                  refresh()
+              }
+
+              override fun onSharedPreferenceChanged(p: SharedPreferences?, key: String?) {
+                  if (key != "x" && key != "y") refresh()
+              }
+
+              private fun refresh() {
+                  hide()
+                  if (prefs.getBoolean("enabled", false)) show()
+              }
+
+              private fun hide() {
+                  view?.let { v ->
+                      (v.drawable as? AnimatedImageDrawable)?.stop()
+                      runCatching { wm.removeView(v) }
+                  }
+                  view = null
+              }
+
+              private fun loadDrawable(): Drawable {
+                  prefs.getString("gif", null)?.let { s ->
+                      try {
+                          return ImageDecoder.decodeDrawable(ImageDecoder.createSource(contentResolver, Uri.parse(s)))
+                      } catch (_: Exception) {
+                      }
+                  }
+                  return GradientDrawable().apply {
+                      shape = GradientDrawable.OVAL
+                      setColor(Color.RED)
+                      setStroke(4, Color.WHITE)
+                  }
+              }
+
+              private fun show() {
+                  val size = (prefs.getInt("size", 64) * resources.displayMetrics.density).toInt()
+                  val v = ImageView(this)
+                  v.scaleType = ImageView.ScaleType.FIT_CENTER
+                  v.setImageDrawable(loadDrawable())
+                  v.alpha = prefs.getInt("alpha", 100) / 100f
+
+                  // The window is only as big as the cursor, so every touch outside it
+                  // reaches the app underneath without any extra work.
+                  val p = WindowManager.LayoutParams(
+                      size, size,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  p.gravity = Gravity.TOP or Gravity.START
+                  p.x = prefs.getInt("x", 200)
+                  p.y = prefs.getInt("y", 400)
+                  p.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+
+                  var downX = 0f
+                  var downY = 0f
+                  var startX = 0
+                  var startY = 0
+                  var moved = false
+                  val slop = ViewConfiguration.get(this).scaledTouchSlop
+                  v.setOnTouchListener { _, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              downX = e.rawX; downY = e.rawY
+                              startX = p.x; startY = p.y
+                              moved = false
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val mx = e.rawX - downX
+                              val my = e.rawY - downY
+                              if (!moved && hypot(mx, my) > slop) moved = true
+                              if (moved) {
+                                  p.x = startX + mx.toInt()
+                                  p.y = startY + my.toInt()
+                                  wm.updateViewLayout(v, p)
+                              }
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              if (moved) prefs.edit().putInt("x", p.x).putInt("y", p.y).apply()
+                              else tap(v, p)
+                          }
+                      }
+                      true
+                  }
+
+                  wm.addView(v, p)
+                  (v.drawable as? AnimatedImageDrawable)?.apply {
+                      repeatCount = AnimatedImageDrawable.REPEAT_INFINITE
+                      start()
+                  }
+                  view = v
+              }
+
+              // Tap on the cursor: make the window click-through for a moment, then
+              // inject a tap at the cursor's hotspot (window corner + offset settings).
+              private fun tap(v: View, p: WindowManager.LayoutParams) {
+                  val x = (p.x + prefs.getInt("offx", 0)).toFloat()
+                  val y = (p.y + prefs.getInt("offy", 0)).toFloat()
+                  setTouchable(v, p, false)
+                  handler.postDelayed({
+                      val path = Path().apply { moveTo(x, y) }
+                      val gesture = GestureDescription.Builder()
+                          .addStroke(GestureDescription.StrokeDescription(path, 0, 50))
+                          .build()
+                      val sent = dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
+                          override fun onCompleted(g: GestureDescription?) = setTouchable(v, p, true)
+                          override fun onCancelled(g: GestureDescription?) = setTouchable(v, p, true)
+                      }, null)
+                      if (!sent) setTouchable(v, p, true)
+                  }, 80)
+              }
+
+              private fun setTouchable(v: View, p: WindowManager.LayoutParams, on: Boolean) {
+                  if (v !== view) return
+                  p.flags = if (on) p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                  else p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                  wm.updateViewLayout(v, p)
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  if (::prefs.isInitialized) prefs.unregisterOnSharedPreferenceChangeListener(this)
+                  if (::wm.isInitialized) hide()
+                  super.onDestroy()
+              }
+          }
+          GIFCURSOR_EOF
+          mkdir -p "$(dirname app/src/main/java/com/example/gifcursor/MainActivity.kt)"
+          cat > app/src/main/java/com/example/gifcursor/MainActivity.kt <<'GIFCURSOR_EOF'
+          package com.example.gifcursor
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private lateinit var prefs: SharedPreferences
+              private val pickGif = 1
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  prefs = getSharedPreferences("cursor", MODE_PRIVATE)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(40, 40, 40, 40)
+                  }
+                  root.addView(Switch(this).apply {
+                      text = "Show cursor"
+                      isChecked = prefs.getBoolean("enabled", false)
+                      setOnCheckedChangeListener { _, on -> prefs.edit().putBoolean("enabled", on).apply() }
+                  })
+                  root.addView(Button(this).apply {
+                      text = "1. Enable accessibility service"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+                  root.addView(Button(this).apply {
+                      text = "2. Choose GIF"
+                      setOnClickListener {
+                          val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                              addCategory(Intent.CATEGORY_OPENABLE)
+                              type = "image/gif"
+                          }
+                          startActivityForResult(i, pickGif)
+                      }
+                  })
+                  slider(root, "Size (dp)", "size", 64, 24, 200)
+                  slider(root, "Opacity (%)", "alpha", 100, 20, 100)
+                  slider(root, "Hotspot offset X (px)", "offx", 0, -200, 400)
+                  slider(root, "Hotspot offset Y (px)", "offy", 0, -200, 400)
+                  setContentView(ScrollView(this).apply { addView(root) })
+              }
+
+              private fun slider(root: LinearLayout, label: String, key: String, def: Int, min: Int, max: Int) {
+                  val title = TextView(this)
+                  val bar = SeekBar(this)
+                  root.addView(title)
+                  root.addView(bar)
+                  bar.max = max - min
+                  bar.progress = prefs.getInt(key, def) - min
+                  title.text = "$label: ${prefs.getInt(key, def)}"
+                  bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                          title.text = "$label: ${p + min}"
+                      }
+                      override fun onStartTrackingTouch(sb: SeekBar?) {}
+                      override fun onStopTrackingTouch(sb: SeekBar?) {
+                          prefs.edit().putInt(key, (sb?.progress ?: 0) + min).apply()
+                      }
+                  })
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  val uri = data?.data
+                  if (requestCode == pickGif && resultCode == RESULT_OK && uri != null) {
+                      contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                      prefs.edit().putString("gif", uri.toString()).apply()
+                  }
+              }
+          }
+          GIFCURSOR_EOF
+          mkdir -p "$(dirname app/src/main/res/values/strings.xml)"
+          cat > app/src/main/res/values/strings.xml <<'GIFCURSOR_EOF'
+          <resources>
+              <string name="app_name">GIF Cursor</string>
+              <string name="service_desc">Shows a GIF cursor overlay and forwards taps made on it to the app underneath.</string>
+          </resources>
+          GIFCURSOR_EOF
+          mkdir -p "$(dirname app/src/main/res/xml/accessibility_config.xml)"
+          cat > app/src/main/res/xml/accessibility_config.xml <<'GIFCURSOR_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/service_desc"
+              android:notificationTimeout="100" />
+          GIFCURSOR_EOF
+          mkdir -p "$(dirname build.gradle.kts)"
+          cat > build.gradle.kts <<'GIFCURSOR_EOF'
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          GIFCURSOR_EOF
+          mkdir -p "$(dirname gradle.properties)"
+          cat > gradle.properties <<'GIFCURSOR_EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=false
+          GIFCURSOR_EOF
+          mkdir -p "$(dirname settings.gradle.kts)"
+          cat > settings.gradle.kts <<'GIFCURSOR_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "GifCursor"
+          include(":app")
+          GIFCURSOR_EOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.5'
+      - name: Build debug APK
+        working-directory: proj
+        run: gradle --no-daemon assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gif-cursor-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
